@@ -139,8 +139,8 @@ class ShapeNetDataset(Dataset):
                 self.cache[index] = (pos, vec, seg)
 
         # resample
-        # choice = np.random.choice(len(seg), self.npoints, replace=True)
-        choice = farthest_point_sampling_indices(pos, self.npoints)
+        choice = np.random.choice(len(seg), self.npoints, replace=True)
+        # choice = farthest_point_sampling_indices(pos, self.npoints)
         pos = pos[choice, :]
         vec = vec[choice, :]
         seg = seg[choice]

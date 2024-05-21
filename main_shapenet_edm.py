@@ -19,9 +19,20 @@ from scipy.spatial.distance import cdist
 
 from chamferdist import ChamferDistance
 
-NPOINTS = 1024
+NPOINTS = 2048
 
 torch.set_float32_matmul_precision('medium')
+
+
+
+def svd_normalization(point_clouds):
+    B, N, D = point_clouds.shape
+    centered_point_clouds = point_clouds - point_clouds.mean(dim=1, keepdim=True)
+    cov_matrix = centered_point_clouds.transpose(1, 2) @ centered_point_clouds / (N - 1)
+    U, S, V = torch.svd(cov_matrix)
+    normalized_point_clouds = torch.bmm(centered_point_clouds, V)
+    return normalized_point_clouds
+
 
 
 class RandomSOd(torch.nn.Module):
@@ -128,8 +139,11 @@ class EDMPrecond(torch.nn.Module):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        # Simply condition by concatenating the noise level to the input
-        x_in = torch.cat([c_in * x, c_noise.expand(x.shape[0], 1)], dim=-1)
+        # Simply condition by concatenating the noise level to the input  
+        # x_in = torch.cat([c_in * x, c_noise.expand(x.shape[0], 1)], dim=-1)
+        # Specific for shapenet: no node feature diffusion (and thus also no conditioning)
+        x = torch.ones_like(x)
+        x_in = torch.cat([x, c_noise.expand(x.shape[0], 1)], dim=-1)
         pos_in = c_in * pos
         if isinstance(self.model, Rapidash):
             dx, dpos = self.model(x_in, pos_in, edge_index, batch)
@@ -146,7 +160,8 @@ class EDMPrecond(torch.nn.Module):
             raise NotImplementedError
         
         # Noise dependent skip connection
-        D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        # D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        D_x = torch.ones_like(x)  # Shapenet fix: has no node features
         D_pos = c_skip * pos + c_out * F_pos.to(torch.float32)
         return D_x, D_pos
 
@@ -186,7 +201,8 @@ class EDMLoss:
         weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
 
         # Noised inputs
-        x_noisy = x + torch.randn_like(x) * sigma
+        # x_noisy = x + torch.randn_like(x) * sigma
+        x_noisy = torch.ones_like(x)
         pos_noisy = pos + subtract_mean(torch.randn_like(pos), batch) * sigma
 
         # The network net is a the precondioned version of the model, including noise dependent skip-connections
@@ -194,25 +210,8 @@ class EDMLoss:
         # For shapenet we ignore the features (which are one anyway)
         # Todo: take normal vectors as features?
         D_x, D_pos = net(x_noisy, pos_noisy, edge_index, batch, sigma)
-
-        loss = 0
-        batch_size = batch.max().item() + 1
-        # For each graph in the batch
-        for b in range(batch_size):
-            pos_b = pos[batch==b]
-            D_pos_b = D_pos[batch==b]
-
-            # Compute nearest neighbor distances for a uniformity loss (todo: not sure if necessary)
-            D_dist = torch.cdist(D_pos_b, D_pos_b, p=2).squeeze(0)
-            mask = torch.eye(D_dist.size(0), device=D_dist.device).bool()
-            D_dist = D_dist + mask.float() * 1e10
-            D_nearest_distances, _ = torch.topk(D_dist, k=3, dim=1, largest=False)
-            D_nearest_distances_mean = D_nearest_distances.mean()
-            uniformity_loss = (D_nearest_distances - D_nearest_distances_mean).pow(2).mean()
-
-            # The losses
-            loss += weight[batch==b][0] * self.chamferdistance(pos_b[None], D_pos_b[None], bidirectional=True) / (2 * len(pos_b)) / batch_size
-            loss += uniformity_loss / batch_size
+        error_pos = (D_pos - pos) ** 2
+        loss = (weight * error_pos).mean()
 
         return loss, (D_x, D_pos)
 
@@ -266,6 +265,7 @@ def edm_sampler(
         pos_hat = pos_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * randn_like(pos_cur)
 
         # Euler step.
+        x_hat = torch.ones_like(x_hat)  # Shapenet fix: node features should always be ones
         x_denoised, pos_denoised = net(x_hat, pos_hat, edge_index, batch, t_hat)
         dx_cur = (x_hat - x_denoised) / t_hat
         dpos_cur = (pos_hat - pos_denoised) / t_hat
@@ -274,10 +274,13 @@ def edm_sampler(
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
+            x_next = torch.ones_like(x_next)  # Shapenet fix: node features should always be ones
             x_denoised, pos_denoised = net(x_next, pos_next, edge_index, batch, t_next)
+            x_denoised = torch.ones_like(x_denoised)  # Shapenet fix: node features should always be ones
             dx_prime = (x_next - x_denoised) / t_next
             dpos_prime = (pos_next - pos_denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * dx_cur + 0.5 * dx_prime)
+            x_next = torch.ones_like(x_next)  # Shapenet fix: node features should always be ones
             pos_next = pos_hat + (t_next - t_hat) * (0.5 * dpos_cur + 0.5 * dpos_prime)
 
         steps.append((x_next.cpu(),pos_next.cpu()))
@@ -338,7 +341,7 @@ class DiffusionModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, _ = self.criterion(self.model, batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch['batch'].max()+1)
-        rand_idx = np.random.randint(0, batch.max()+1)
+        rand_idx = np.random.randint(0, (batch['batch'].max()+1).item())
         wandb.log({"reference_point_cloud": wandb.Object3D(batch['pos'][batch['batch']==rand_idx].cpu().numpy())})
         return loss
     
@@ -346,7 +349,9 @@ class DiffusionModel(pl.LightningModule):
         # Just to have some reference visualization
         samples = self.sample(self.hparams.batch_size)
         rand_idx = np.random.randint(0, len(samples))
-        shape = samples[rand_idx][0].cpu().numpy()
+        # shape = samples[rand_idx][0].cpu().numpy()
+        shape = samples[rand_idx][0]
+        shape = svd_normalization(shape[None])[0].cpu().numpy()
         wandb.log({"val_gen_point_cloud": wandb.Object3D(shape)})
         return super().on_validation_epoch_end()
     
@@ -354,7 +359,10 @@ class DiffusionModel(pl.LightningModule):
         return None
     
     def on_test_epoch_end(self):
-        samples = self.sample(self.hparams.batch_size)
+        samples = []
+        for i in range(10):
+            samples += self.sample(self.hparams.batch_size)
+        # samples = self.sample(self.hparams.batch_size)
         for i, (pos, x) in enumerate(samples):
             wandb.log({"test_point_cloud": wandb.Object3D(pos.cpu().numpy())})
         return super().on_test_epoch_end()
@@ -373,6 +381,7 @@ class DiffusionModel(pl.LightningModule):
             pos_0 = torch.randn([len(batch_idx), 3], device=self.device)
             pos_0 = subtract_mean(pos_0, batch_idx)
             x_0 = torch.randn([len(batch_idx), 1], device=self.device)
+            x_0 = torch.ones_like(x_0)
             edge_index = None
             samples = edm_sampler(self.model, pos_0, x_0, edge_index, batch_idx, S_churn=self.hparams.S_churn, num_steps=self.hparams.num_steps, sigma_max=self.hparams.sigma_max)
         # Convert to list of molecules (!!!! AND WE SWAP THE ORDER TO POS, FEATURE, CHARGES !!!!)
@@ -411,7 +420,8 @@ def main(args):
 
     # Logging settings
     if args.log:
-        logger = pl.loggers.WandbLogger(project="PONITA-ShapeNet-EDM", name=args.model+"-EDM", config=args, save_dir='logs')
+        save_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "logs")
+        logger = pl.loggers.WandbLogger(project="PONITA-ShapeNet-EDM", name=args.model+"-EDM", config=args, save_dir=save_dir)
     else:
         logger = None
 
@@ -443,7 +453,7 @@ if __name__ == "__main__":
     
     # Run parameters
     parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=10)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-12)
     parser.add_argument('--log', type=eval, default=True)
@@ -464,12 +474,12 @@ if __name__ == "__main__":
 
     # PONTA model settings
     parser.add_argument('--num_ori', type=int, default=12)
-    parser.add_argument('--hidden_dim', type=eval, default=[32,64,128,256])
+    parser.add_argument('--hidden_dim', type=eval, default=[256,256,256,256,256])
     parser.add_argument('--basis_dim', type=int, default=256)
     parser.add_argument('--degree', type=int, default=2)
-    parser.add_argument('--layers', type=eval, default=[1, 1, 1, 1])
-    parser.add_argument('--edge_types', type=eval, default=["knn-8", "knn-8", "knn-8", "fc"])
-    parser.add_argument('--ratios', type=eval, default=[0.25, 0.25, 0.25])
+    parser.add_argument('--layers', type=eval, default=[0, 1, 1, 1, 1])
+    parser.add_argument('--edge_types', type=eval, default=["knn-8","knn-8", "knn-8", "knn-8", "fc"])
+    parser.add_argument('--ratios', type=eval, default=[0.25, 0.25, 0.25, 0.25])
     parser.add_argument('--widening_factor', type=int, default=4)
     parser.add_argument('--layer_scale', type=eval, default=None)
     parser.add_argument('--multiple_readouts', type=eval, default=False)
