@@ -740,7 +740,7 @@ class Rapidash(nn.Module):
 
         return data_per_layer + data_per_layer_up
 
-    def forward(self, x, pos, edge_index, batch=None):
+    def forward(self, x, pos, edge_index, batch=None, vec=None):
         ori_grid = self.ori_grid.type_as(pos)
 
         # Precompute the interaction and transition layers
@@ -752,8 +752,14 @@ class Rapidash(nn.Module):
         )
 
         # Initial feature embeding
-        x = self.x_embedder(x)
+        # Lift the scalars ([B*N,Cs]->[B*N,O,Cs]):
         x = x.unsqueeze(-2).repeat_interleave(ori_grid.shape[-2], dim=-2)  # [B*N,O,C]
+        # lift the vectors ([B*N,C,3]->[B*N,O,C]) and concatenate
+        if vec is not None:
+            vec = torch.einsum('bcd,nd->bnc', vec, ori_grid)
+            x = torch.cat([x, vec], dim=-1)
+        # Embed the inputs
+        x = self.x_embedder(x)
 
         # Interaction + transition + readout
         readouts = []

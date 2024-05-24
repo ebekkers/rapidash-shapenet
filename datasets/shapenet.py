@@ -52,7 +52,7 @@ class ShapeNetDataset(Dataset):
         'Pistol': '03948459', 'Rocket': '04099429', 'Skateboard': '04225987', 'Table': '04379243'
     }
 
-    def __init__(self, root, categories=None, split='train', npoints=500):
+    def __init__(self, root, categories=None, split='train', npoints=500, fps=False):
         self.root = root
         self.base_dir = os.path.join(self.root, 'shapenetcore_partanno_segmentation_benchmark_v0_normal')
         self.catfile = os.path.join(self.base_dir, 'synsetoffset2category.txt')
@@ -61,6 +61,7 @@ class ShapeNetDataset(Dataset):
         self.data_files = []
         self.npoints = npoints
         self.cat = {}
+        self.fps = fps
         
         if not os.path.exists(self.base_dir):
             self.download_and_extract()
@@ -139,8 +140,11 @@ class ShapeNetDataset(Dataset):
                 self.cache[index] = (pos, vec, seg)
 
         # resample
-        choice = np.random.choice(len(seg), self.npoints, replace=True)
-        # choice = farthest_point_sampling_indices(pos, self.npoints)
+        if self.fps:
+            choice = farthest_point_sampling_indices(pos, self.npoints)
+        else:
+            choice = np.random.choice(len(seg), self.npoints, replace=True)
+        
         pos = pos[choice, :]
         vec = vec[choice, :]
         seg = seg[choice]

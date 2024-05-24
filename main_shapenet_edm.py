@@ -131,7 +131,7 @@ class EDMPrecond(torch.nn.Module):
         self.sigma_data = sigma_data
         self.model = model
 
-    def forward(self, x, pos, edge_index, batch, sigma):
+    def forward(self, x, pos, edge_index, batch, sigma, rot=None):
         sigma = sigma.reshape(-1, 1)
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -145,8 +145,15 @@ class EDMPrecond(torch.nn.Module):
         x = torch.ones_like(x)
         x_in = torch.cat([x, c_noise.expand(x.shape[0], 1)], dim=-1)
         pos_in = c_in * pos
+        if rot is not None:
+             # Transpose because the columns are the reference vectors (the basis)
+             # vec should be a shape [batch, num_vec, 3] tensor
+             # rot is in that sence formated as [3, num_vec], hence the transpose
+            vec_in = rot.transpose(-2,-1).unsqueeze(0).expand(x_in.shape[0], -1, -1) 
+        else:
+            vec_in = None
         if isinstance(self.model, Rapidash):
-            dx, dpos = self.model(x_in, pos_in, edge_index, batch)
+            dx, dpos = self.model(x_in, pos_in, edge_index, batch, vec=vec_in)
             dpos = subtract_mean(dpos, batch)
             # dx and dpos denote denoising gradients, relative to the input,
             # so predicted denoised version of pre-conditioned input is:
@@ -190,7 +197,7 @@ class EDMLoss:
     ):
         
         # The point clouds and fully connected edge_index
-        pos, x, edge_index, batch = inputs['pos'], inputs['x'], inputs['edge_index'], inputs['batch']
+        pos, x, edge_index, batch, rot = inputs['pos'], inputs['x'], inputs['edge_index'], inputs['batch'], inputs['rot']
         pos = subtract_mean(pos, batch)
         x = x / self.normalize_x_factor
 
@@ -209,7 +216,7 @@ class EDMLoss:
         # D_x and D_pos are the denoised features and positions
         # For shapenet we ignore the features (which are one anyway)
         # Todo: take normal vectors as features?
-        D_x, D_pos = net(x_noisy, pos_noisy, edge_index, batch, sigma)
+        D_x, D_pos = net(x_noisy, pos_noisy, edge_index, batch, sigma, rot)
         error_pos = (D_pos - pos) ** 2
         loss = (weight * error_pos).mean()
 
@@ -233,6 +240,7 @@ def edm_sampler(
     S_max=float("inf"),
     S_noise=1,
     return_intermediate=False,
+    random_rot=False
 ):
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
@@ -253,6 +261,13 @@ def edm_sampler(
     # Main sampling loop.
     x_next, pos_next = x_0 * t_steps[0], pos_0 * t_steps[0]
     steps = [(x_next.cpu(), pos_next.cpu())]
+    
+    if random_rot:
+        rotation_generator = RandomSOd(3)
+        rot = rotation_generator().type_as(pos_0)
+    else:  
+        rot = torch.eye(3, device=pos_0.device)
+    
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):  # 0, ..., N-1
         x_cur, pos_cur = x_next, pos_next
 
@@ -266,7 +281,7 @@ def edm_sampler(
 
         # Euler step.
         x_hat = torch.ones_like(x_hat)  # Shapenet fix: node features should always be ones
-        x_denoised, pos_denoised = net(x_hat, pos_hat, edge_index, batch, t_hat)
+        x_denoised, pos_denoised = net(x_hat, pos_hat, edge_index, batch, t_hat, rot)
         dx_cur = (x_hat - x_denoised) / t_hat
         dpos_cur = (pos_hat - pos_denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * dx_cur
@@ -275,7 +290,7 @@ def edm_sampler(
         # Apply 2nd order correction.
         if i < num_steps - 1:
             x_next = torch.ones_like(x_next)  # Shapenet fix: node features should always be ones
-            x_denoised, pos_denoised = net(x_next, pos_next, edge_index, batch, t_next)
+            x_denoised, pos_denoised = net(x_next, pos_next, edge_index, batch, t_next, rot)
             x_denoised = torch.ones_like(x_denoised)  # Shapenet fix: node features should always be ones
             dx_prime = (x_next - x_denoised) / t_next
             dpos_prime = (pos_next - pos_denoised) / t_next
@@ -299,7 +314,7 @@ class DiffusionModel(pl.LightningModule):
         self.rotation_generator = RandomSOd(3)
 
         in_channels_scalar = 1
-        in_channels_vec = 0
+        in_channels_vec = 3
         out_channels_scalar = 1
         out_channels_vec = 1
 
@@ -334,11 +349,15 @@ class DiffusionModel(pl.LightningModule):
         if self.hparams.train_augm:
             rot = self.rotation_generator().type_as(batch['pos'])
             batch['pos'] = torch.einsum('ij, bj->bi', rot, batch['pos'])
+            batch['rot'] = rot
+        else:
+            batch['rot'] = torch.eye(3, device=batch['pos'].device)
         loss, _ = self.criterion(self.model, batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch['batch'].max()+1)
         return loss
 
     def validation_step(self, batch, batch_idx):
+        batch['rot'] = torch.eye(3, device=batch['pos'].device)
         loss, _ = self.criterion(self.model, batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch['batch'].max()+1)
         rand_idx = np.random.randint(0, (batch['batch'].max()+1).item())
@@ -347,11 +366,12 @@ class DiffusionModel(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         # Just to have some reference visualization
-        samples = self.sample(self.hparams.batch_size)
+        samples = self.sample(self.hparams.batch_size, random_rot=False)
         rand_idx = np.random.randint(0, len(samples))
         # shape = samples[rand_idx][0].cpu().numpy()
         shape = samples[rand_idx][0]
-        shape = svd_normalization(shape[None])[0].cpu().numpy()
+        # shape = svd_normalization(shape[None])[0].cpu().numpy()
+        shape = shape.cpu().numpy()
         wandb.log({"val_gen_point_cloud": wandb.Object3D(shape)})
         return super().on_validation_epoch_end()
     
@@ -361,7 +381,7 @@ class DiffusionModel(pl.LightningModule):
     def on_test_epoch_end(self):
         samples = []
         for i in range(10):
-            samples += self.sample(self.hparams.batch_size)
+            samples += self.sample(self.hparams.batch_size, random_rot=False)
         # samples = self.sample(self.hparams.batch_size)
         for i, (pos, x) in enumerate(samples):
             wandb.log({"test_point_cloud": wandb.Object3D(pos.cpu().numpy())})
@@ -372,7 +392,7 @@ class DiffusionModel(pl.LightningModule):
         scheduler = CosineAnnealingLR(optimizer, T_max=self.trainer.max_epochs, eta_min=1e-6)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
     
-    def sample(self, num_molecules=100):
+    def sample(self, num_molecules=100, random_rot=False):
         self.eval()
         with torch.no_grad():
             num_atoms = torch.tensor([NPOINTS] * num_molecules, dtype=torch.long, device=self.device)
@@ -383,7 +403,7 @@ class DiffusionModel(pl.LightningModule):
             x_0 = torch.randn([len(batch_idx), 1], device=self.device)
             x_0 = torch.ones_like(x_0)
             edge_index = None
-            samples = edm_sampler(self.model, pos_0, x_0, edge_index, batch_idx, S_churn=self.hparams.S_churn, num_steps=self.hparams.num_steps, sigma_max=self.hparams.sigma_max)
+            samples = edm_sampler(self.model, pos_0, x_0, edge_index, batch_idx, S_churn=self.hparams.S_churn, num_steps=self.hparams.num_steps, sigma_max=self.hparams.sigma_max, random_rot=random_rot)
         # Convert to list of molecules (!!!! AND WE SWAP THE ORDER TO POS, FEATURE, CHARGES !!!!)
         sample_list = []
         for i in range(batch_idx.max()+1):
